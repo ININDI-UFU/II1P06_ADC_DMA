@@ -1,4 +1,7 @@
 {
+    "terminal.integrated.env.windows": {
+        "GDB_INDEX_CACHE_DIR": "C:\\Windows\\Temp\\gdb_cache"
+    },
     "files.associations": {
         "system_error": "cpp",
         "cmath": "cpp",
@@ -53,9 +56,6 @@
         "ratio": "cpp",
         "mutex": "cpp",
         "thread": "cpp",
-        "list": "cpp",
-        "xhash": "cpp",
-        "xstring": "cpp",
-        "xutility": "cpp"
+        "wokwi-api.h": "c"
     }
 }
