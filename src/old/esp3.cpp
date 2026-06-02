@@ -51,7 +51,7 @@ void taskBlink(void* pvParameters) {
 // Task de leitura analógica: recebe período via pvParameters
 void taskManagerInput(void* pvParameters) {
     const InputParams* params = static_cast<InputParams*>(pvParameters);
-    for (;;) {
+    for (;;) {agora atualiza o readme.md ou faça outro que descreve como usar esta biblioteca e esplica como o codigo funciona o dma.cpp
         managerInputFunc();
         vTaskDelay(pdMS_TO_TICKS(params->delayMs));
     }

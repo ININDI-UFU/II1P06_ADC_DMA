@@ -1,159 +1,67 @@
-/**
- * @file dma.cpp
- * @brief Exemplo: leitura de ADC com DMA no ESP32-S3 + envio UDP via wserial.
- *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │  Fluxo geral                                                            │
- * │                                                                         │
- * │  GPIO4 (ADC1_CH3) ──► ADC DMA ──► frame 64 amostras ──► UDP/Serial    │
- * │                                                         (wserial.plot) │
- * └─────────────────────────────────────────────────────────────────────────┘
- *
- * Hardware (ESP32-S3):
- *   GPIO4 = ADC1_CH3  →  entrada analógica 0–3.3 V
- *
- * Protocolo de plot (compatível com plotRawUDPServer.py):
- *   >adc_raw:<timestamp_ms>:<valor>§counts
- *   ou, para blocos:
- *   >adc_raw:<t0>:<v0>;<t1>:<v1>;...§counts
- */
+// https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/adc_continuous.html
+#include <Arduino.h>
 
-// KIT_HOSTNAME e KIT_ID devem ser definidos pelo platformio.ini (-D flag).
-// Os #ifndef abaixo servem de fallback para compilação manual.
-#ifndef KIT_HOSTNAME
-#define KIT_HOSTNAME "iikit-dma"
-#endif
-#ifndef KIT_ID
-#define KIT_ID 0
-#endif
+#define LASEC_MAX_TASKS 2
+#include "util/lasecTask.h"
 
-#include "iikit.h"              ///< WiFi, Serial/UDP, display, GPIOs
-#include "services/AdcDmaEsp.h" ///< ADC contínuo com DMA (ESP32-S3)
+#include "services/lasecNet.h"
+#include "services/wserial.h"
+#include "services/display_ssd1306.h"
+#include "services/AdcDmaEsp.h"
 
-// ── Parâmetros de aquisição ──────────────────────────────────────────────────
+constexpr uint8_t def_pin_SDA = 21;
+constexpr uint8_t def_pin_SCL = 22;
 
-/** Canal ADC1 usado. ADC_CHANNEL_3 = GPIO4 no ESP32-S3. */
-static constexpr adc_channel_t ADC_CH = ADC_CHANNEL_3;
+// ---------- Parâmetros de aquisição ----------
+constexpr adc_channel_t ADC_CH    = ADC_CHANNEL_3; // GPIO4 no ESP32-S3
+constexpr uint32_t      SAMPLE_HZ = 20000;          // 20 kHz total
 
-/**
- * Frequência de amostragem total em Hz.
- * Com 1 canal: 20 000 amostras/s → período de 50 µs entre amostras.
- * Limite do ESP32-S3: 611 Hz (mín) a ~83 333 Hz (máx).
- */
-static constexpr uint32_t SAMPLE_HZ = 20000;
+// ---------- Buffers de leitura ----------
+static AdcDmaSample _samples[ADC_DMA_SAMPLES_PER_FRAME];  // amostras decodificadas
+static uint16_t     _rawValues[ADC_DMA_SAMPLES_PER_FRAME]; // apenas os valores (para plot)
+static uint32_t     _frameCount = 0;
 
-/**
- * Período entre frames em ms (para o plot de array).
- * dt_ms por amostra = 1 000 000 / SAMPLE_HZ µs = 50 µs → usamos 0 ms
- * (o wserial assume timestamps consecutivos ao receber dt_ms = 0).
- *
- * Se quiser ver o eixo de tempo corretamente no plotter, aumente dt_ms
- * para um valor inteiro em ms (ex.: 1 ms → taxa efetiva de 1 kHz).
- */
-static constexpr uint32_t PLOT_DT_MS = 0;
+// ---------- Funções auxiliares ----------
 
-// ── Buffers locais ───────────────────────────────────────────────────────────
-
-/** Buffer para decodificação das amostras de cada frame. */
-static AdcDmaSample _samples[ADC_DMA_SAMPLES_PER_FRAME];
-
-/** Valores brutos extraídos para envio via wserial.plot (array). */
-static uint16_t _rawValues[ADC_DMA_SAMPLES_PER_FRAME];
-
-// ── Tarefas periódicas (ltask) ───────────────────────────────────────────────
-
-/** Contador de frames processados (atualizado no loop). */
-static volatile uint32_t _frameCount = 0;
-
-/**
- * @brief Envia diagnóstico a cada 1 segundo pelo wserial.
- * Registrada em ltask.attach(); executada fora de ISR.
- */
-static void taskStatus() {
-    wserial.log(("DMA ok | frames=" + String(_frameCount) +
-                 " | heap=" + String(esp_get_free_heap_size())).c_str());
+// Atualiza o display com a contagem de frames recebidos
+void updateDisplayFunc() {
+    disp.setText(3, ("frames: " + String(_frameCount)).c_str());
 }
 
-// ── Setup ────────────────────────────────────────────────────────────────────
-
+// ---------- Setup ----------
 void setup() {
+    wserial.begin();
+    disp.begin(def_pin_SDA, def_pin_SCL);
+    net.begin(KIT_HOSTNAME);
 
-    // 1. Inicializa todo o kit: Serial, WiFi (via portal se necessário),
-    //    mDNS, OTA, display OLED, GPIOs e debounce.
-    IIKit.begin();
+    disp.setText(1, (WiFi.localIP().toString() + " ID:" + String(KIT_ID)).c_str());
+    disp.setText(2, KIT_HOSTNAME);
+    disp.setText(3, "ADC DMA 20kHz");
 
-    wserial.println("=== ADC DMA ESP32-S3 ===");
-    wserial.println("Canal:  ADC1_CH3 (GPIO4)");
-    wserial.println("Taxa:   " + String(SAMPLE_HZ) + " Hz");
-    wserial.println("Frame:  " + String(ADC_DMA_SAMPLES_PER_FRAME) + " amostras");
+    adcDma.begin(ADC_CH, SAMPLE_HZ); // configura ADC1_CH3 a 20 kHz com DMA
+    adcDma.start();                   // inicia as conversões; ISR sinaliza quando frame pronto
 
-    // 2. Configura o ADC DMA.
-    //    begin() internamente:
-    //      a) Aloca o pool DMA (ADC_DMA_POOL_SIZE bytes)
-    //      b) Configura ADC1_CH3, atenuação 0–3.3 V, 12 bits
-    //      c) Registra a ISR que seta _ready quando o frame estiver cheio
-    if (!adcDma.begin(ADC_CH, SAMPLE_HZ)) {
-        wserial.println("ERRO: falha ao inicializar ADC DMA");
-        while (true) delay(1000);  // para aqui — verifique a Serial
-    }
-
-    // 3. Inicia as conversões DMA.
-    //    A partir daqui, o hardware começa a amostrar e preencher o buffer;
-    //    quando o frame atingir ADC_DMA_FRAME_SIZE bytes, _ready = true.
-    if (!adcDma.start()) {
-        wserial.println("ERRO: falha ao iniciar ADC DMA");
-        while (true) delay(1000);
-    }
-
-    // 4. Configura o escalonador de tarefas periódicas.
-    //    ltask dispara a 1 kHz; taskStatus é chamada a cada 1000 ticks = 1 s.
     ltask.begin(1000);
-    ltask.attach(taskStatus, 1000);
-
-    wserial.println("Pronto. Aguardando amostras DMA...");
+    ltask.attach(updateDisplayFunc, 1000); // atualiza display a cada 1 s
 }
 
-// ── Loop ─────────────────────────────────────────────────────────────────────
-
+// ---------- Loop principal ----------
 void loop() {
-
-    // ── Serviços de fundo ────────────────────────────────────────────────────
-    // Mantém WiFi/OTA, processa UDP, atualiza display e debounce dos botões.
-    IIKit.update();
-
-    // Drena a fila do escalonador e executa taskStatus se o tick chegou.
+    wserial.update();
+    disp.update();
+    net.update();
     ltask.update();
 
-    // ── Leitura DMA ──────────────────────────────────────────────────────────
-    // available() retorna true quando a ISR do DMA sinalizou frame completo.
-    // Isso acontece a cada ADC_DMA_FRAME_SIZE / (4 * SAMPLE_HZ) segundos
-    //   = 256 / (4 * 20000) = 3.2 ms para 20 kHz.
+    // adcDma.available() retorna true quando a ISR sinalizou um frame completo (~3 ms a 20 kHz)
     if (!adcDma.available()) return;
 
-    // read() drena o frame, decodifica TYPE2→AdcDmaSample e limpa o flag.
-    // Retorna o número real de amostras decodificadas (≤ ADC_DMA_SAMPLES_PER_FRAME).
+    // lê e decodifica o frame; _frameCount é limpo pelo read() internamente
     size_t n = adcDma.read(_samples, ADC_DMA_SAMPLES_PER_FRAME);
     if (n == 0) return;
 
     _frameCount++;
 
-    // Extrai apenas os valores brutos (uint16_t) para o wserial.plot de array.
-    // O canal de origem está em _samples[i].channel — útil com múltiplos canais.
-    for (size_t i = 0; i < n; i++) {
-        _rawValues[i] = _samples[i].value;
-    }
-
-    // Envia o bloco completo via UDP (ou Serial se UDP não estiver ligado).
-    // Formato: >adc_raw:<t>:<v0>;<t+dt>:<v1>;...§counts
-    // PLOT_DT_MS=0 → wserial usa timestamps consecutivos de 1 ms.
-    wserial.plot("adc_raw", PLOT_DT_MS, _rawValues, n, "counts");
-
-    // ── Exemplo de filtragem simples (média do frame) ────────────────────────
-    // Descomente para enviar também a média por frame (taxa muito menor).
-    /*
-    uint32_t soma = 0;
-    for (size_t i = 0; i < n; i++) soma += _rawValues[i];
-    uint16_t media = (uint16_t)(soma / n);
-    wserial.plot("adc_media", media, "counts");
-    */
+    // extrai os valores brutos (0–4095) e envia o bloco via UDP/Serial
+    for (size_t i = 0; i < n; i++) _rawValues[i] = _samples[i].value;
+    wserial.plot("adc_raw", 0, _rawValues, n, "counts");
 }
