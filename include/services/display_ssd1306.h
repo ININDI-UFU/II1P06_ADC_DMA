@@ -17,14 +17,14 @@
 #define SCREEN_HEIGHT 64    ///< Altura do display em pixels.
 #define OLED_RESET -1       ///< Pino de reset (ou -1 para compartilhar com o reset do Arduino).
 
-inline Adafruit_SSD1306 SSD1306(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
 /**
  * @class Display_SSD1306
  * @brief Classe para gerenciamento de displays OLED.
  */
 class Display_SSD1306 {
 protected:
+    Adafruit_SSD1306 *_display = nullptr;
+
     /**
      * @brief Realiza a rolagem de texto na linha especificada.
      * @param index Índice da linha a ser rolada.
@@ -40,6 +40,8 @@ protected:
     int16_t i16_lineMinWidth[3]; ///< Largura mínima para rolagem do texto.
 
 public:
+    ~Display_SSD1306();
+
     /**
      * @brief Configura o texto a ser exibido em uma linha do display.
      * @param line Índice da linha (1 a 3).
@@ -56,12 +58,11 @@ public:
     void setFuncMode(bool funcMode);
 
     /**
-     * @brief Inicializa o display OLED.
-     * @param SDA Pino SDA para comunicação I2C.
-     * @param SCL Pino SCL para comunicação I2C.
-     * @return true se a inicialização foi bem-sucedida, false caso contrário.
+     * @brief Inicializa o display OLED usando um barramento I2C ja configurado.
+     * @param wire Barramento configurado antes com Wire.begin(SDA, SCL).
+     * @return true se a inicializacao foi bem-sucedida, false caso contrario.
      */
-    bool begin(const uint8_t &SDA = 0, const uint8_t &SCL = 0);
+    bool begin(TwoWire &wire = Wire);
 
     /**
      * @brief Atualiza o conteúdo do display OLED.
@@ -69,14 +70,15 @@ public:
     void update(void);
 };
 
-bool Display_SSD1306::begin(const uint8_t &SDA, const uint8_t &SCL) {
-    if (SDA != 0 && SCL != 0) {
-        Wire.begin(SDA, SCL);
-    } else {
-        Wire.begin();
-    }
+bool Display_SSD1306::begin(TwoWire &wire) {
+    delete _display;
+    _display = new Adafruit_SSD1306(SCREEN_WIDTH, SCREEN_HEIGHT, &wire, OLED_RESET);
+    if (!_display) return false;
+
     // periphBegin=false: evita que SSD1306.begin() reinicialize o Wire e sobrescreva os pinos
-    if (!SSD1306.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS, false, false)) {
+    if (!_display->begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS, false, false)) {
+        delete _display;
+        _display = nullptr;
         return false;
     }
     setText(1, ca_lineTxt[0]);
@@ -85,25 +87,43 @@ bool Display_SSD1306::begin(const uint8_t &SDA, const uint8_t &SCL) {
     return true;
 }
 
+Display_SSD1306::~Display_SSD1306() {
+    delete _display;
+}
+
 void Display_SSD1306::update(void) {
-    if (ui8_lineSize[0] > 10 || ui8_lineSize[1] > 10 || ui8_lineSize[2] > 10 || isChanged) {
-        isChanged = false;
-        SSD1306.clearDisplay();
-        SSD1306.setTextWrap(false);
-        SSD1306.setTextColor(SSD1306_WHITE);
-        SSD1306.cp437(true);
-        rotaty(0);
-        rotaty(1);
-        rotaty(2);
-        SSD1306.display();
+    if (!_display) return;
+
+    const bool hasScrollingText = ui8_lineSize[0] > 10 || ui8_lineSize[1] > 10 || ui8_lineSize[2] > 10;
+    static uint32_t lastScrollMs = 0;
+    const uint32_t now = millis();
+
+    if (!isChanged && (!hasScrollingText || now - lastScrollMs < 100)) {
+        return;
     }
+
+    if (hasScrollingText) {
+        lastScrollMs = now;
+    }
+
+    isChanged = false;
+    _display->clearDisplay();
+    _display->setTextWrap(false);
+    _display->setTextColor(SSD1306_WHITE);
+    _display->cp437(true);
+    rotaty(0);
+    rotaty(1);
+    rotaty(2);
+    _display->display();
 }
 
 void Display_SSD1306::rotaty(uint8_t index) {
+    if (!_display) return;
+
     if (ui8_lineSize[index] > 10) {
-        SSD1306.setTextSize(ui8_txtSize[index]);
-        SSD1306.setCursor(i16_lineWidth[index], index * 20);
-        SSD1306.print(ca_lineTxt[index]);
+        _display->setTextSize(ui8_txtSize[index]);
+        _display->setCursor(i16_lineWidth[index], index * 20);
+        _display->print(ca_lineTxt[index]);
         if (scrollLeft[index]) {
             ++i16_lineWidth[index];
         } else {
@@ -116,18 +136,23 @@ void Display_SSD1306::rotaty(uint8_t index) {
             scrollLeft[index] = false;
         }
     } else {
-        SSD1306.setTextSize(ui8_txtSize[index]);
-        SSD1306.setCursor(0, index * 20);
-        SSD1306.println(ca_lineTxt[index]);
+        _display->setTextSize(ui8_txtSize[index]);
+        _display->setCursor(0, index * 20);
+        _display->println(ca_lineTxt[index]);
     }
 }
 
 void Display_SSD1306::setText(uint8_t line, const char txt[], bool funcMode, uint8_t txtSize) {
+    if (line < 1 || line > 3) {
+        return;
+    }
     if (this->isFuncMode == funcMode) {
-        strcpy(ca_lineTxt[line - 1], txt);
-        ui8_lineSize[line - 1] = strlen(ca_lineTxt[line - 1]);
-        i16_lineMinWidth[line - 1] = -12 * (ui8_lineSize[line - 1] - 9);
-        ui8_txtSize[line - 1] = txtSize;
+        const uint8_t index = line - 1;
+        strncpy(ca_lineTxt[index], txt ? txt : "", sizeof(ca_lineTxt[index]) - 1);
+        ca_lineTxt[index][sizeof(ca_lineTxt[index]) - 1] = '\0';
+        ui8_lineSize[index] = strlen(ca_lineTxt[index]);
+        i16_lineMinWidth[index] = -12 * (ui8_lineSize[index] - 9);
+        ui8_txtSize[index] = txtSize;
         isChanged = true;
     }
     update();

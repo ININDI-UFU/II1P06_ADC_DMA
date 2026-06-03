@@ -52,14 +52,15 @@ void updateDisplay() {
 // ---------- Setup ----------
 void setup() {
     wserial.begin();
-    disp.begin(def_pin_SDA, def_pin_SCL);
+    Wire.begin(def_pin_SDA, def_pin_SCL);
+    disp.begin(Wire);
     net.begin(KIT_HOSTNAME);
 
     disp.setText(1, (WiFi.localIP().toString() + " ID:" + String(KIT_ID)).c_str());
     disp.setText(2, KIT_HOSTNAME);
     disp.setText(3, "ISR ADS1115 20Hz");
 
-    ads1115.begin();
+    ads1115.begin(Wire);
 
     // 50 ms = 50 000 µs → 20 Hz
     _timer = timerBegin(0, 80, true);
