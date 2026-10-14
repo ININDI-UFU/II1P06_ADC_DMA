@@ -1,6 +1,6 @@
 // https://docs.espressif.com/projects/arduino-esp32/en/latest/api/timer.html
 #include <Arduino.h>
-
+#include <Wire.h>
 #include "services/lasecNet.h"
 #include "services/wserial.h"
 #include "services/display_ssd1306.h"
@@ -9,11 +9,8 @@
 constexpr uint8_t def_pin_SDA = 21;
 constexpr uint8_t def_pin_SCL = 22;
 
-// ---------- Timer de hardware ----------
-// API v2.x: timerBegin(num, divider, countUp)
-//   num=0      : timer 0 do ESP32 (0–3 disponíveis)
-//   divider=80 : 80 MHz ÷ 80 = 1 MHz → 1 tick = 1 µs
-//   countUp    : conta de 0 até o alarme
+// ---------- Timer de hardware (Arduino-ESP32 3.x) ----------
+// timerBegin recebe a frequência desejada em Hz. Com 1 MHz, cada tick vale 1 µs.
 static hw_timer_t* _timer = nullptr;
 
 // ---------- Flag de sincronização ISR → loop() ----------
@@ -62,11 +59,18 @@ void setup() {
 
     ads1115.begin(Wire);
 
-    // 50 ms = 50 000 µs → 20 Hz
-    _timer = timerBegin(0, 80, true);
-    timerAttachInterrupt(_timer, &onTimer, true); // true = borda de subida
-    timerAlarmWrite(_timer, 50000, true);         // 50 000 µs; true = auto-reload
-    timerAlarmEnable(_timer);
+    // Configura o contador do timer para 1 MHz: cada tick equivale a 1 µs.
+    _timer = timerBegin(1000000);
+    // timerBegin retorna nullptr se não conseguir inicializar o timer.
+    if (_timer == nullptr) return;
+
+    // Associa onTimer à interrupção. A função apenas sinaliza _sampleReady;
+    // a leitura do ADS1115 acontece no loop(), fora da ISR.
+    timerAttachInterrupt(_timer, &onTimer);
+
+    // Dispara após 50 000 ticks: 50 000 µs = 50 ms = 20 Hz.
+    // autoreload=true repete o alarme; reload_count=0 não limita as repetições.
+    timerAlarm(_timer, 50000, true, 0);
 }
 
 // ---------- Loop principal ----------

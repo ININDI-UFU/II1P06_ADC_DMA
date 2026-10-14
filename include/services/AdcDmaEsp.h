@@ -43,6 +43,7 @@
  */
 
 #include <Arduino.h>
+#include <cstring>
 #include <esp_adc/adc_continuous.h>  ///< Driver de ADC contínuo do ESP-IDF v5
 
 // ── Parâmetros ajustáveis via #define antes do #include ──────────────────────
@@ -71,7 +72,13 @@
 #endif
 
 /** Número de amostras (AdcDmaSample) em um frame completo. */
-#define ADC_DMA_SAMPLES_PER_FRAME (ADC_DMA_FRAME_SIZE / 4)
+#define ADC_DMA_SAMPLES_PER_FRAME (ADC_DMA_FRAME_SIZE / SOC_ADC_DIGI_DATA_BYTES_PER_CONV)
+
+static_assert(ADC_DMA_FRAME_SIZE > 0, "ADC_DMA_FRAME_SIZE deve ser maior que zero");
+static_assert(ADC_DMA_FRAME_SIZE % SOC_ADC_DIGI_DATA_BYTES_PER_CONV == 0,
+              "ADC_DMA_FRAME_SIZE deve conter conversoes completas");
+static_assert(ADC_DMA_POOL_SIZE >= ADC_DMA_FRAME_SIZE,
+              "ADC_DMA_POOL_SIZE deve ser >= ADC_DMA_FRAME_SIZE");
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -116,6 +123,9 @@ public:
      * @return true se o driver foi inicializado corretamente.
      */
     bool begin(adc_channel_t channel, uint32_t sampleHz) {
+        if (channel < ADC_CHANNEL_0 || channel >= SOC_ADC_CHANNEL_NUM(ADC_UNIT_1) || sampleHz == 0)
+            return false;
+        if (_handle) deinit();
         _channels[0]  = channel;
         _channelCount = 1;
         return _init(sampleHz);
@@ -133,8 +143,13 @@ public:
      * @return true se o driver foi inicializado corretamente.
      */
     bool begin(const adc_channel_t* channels, uint8_t channelCount, uint32_t sampleHz) {
-        if (!channels || channelCount == 0 || channelCount > ADC_DMA_MAX_CHANNELS)
+        if (!channels || channelCount == 0 || channelCount > ADC_DMA_MAX_CHANNELS || sampleHz == 0)
             return false;
+        for (uint8_t i = 0; i < channelCount; i++) {
+            if (channels[i] < ADC_CHANNEL_0 || channels[i] >= SOC_ADC_CHANNEL_NUM(ADC_UNIT_1))
+                return false;
+        }
+        if (_handle) deinit();
         for (uint8_t i = 0; i < channelCount; i++) _channels[i] = channels[i];
         _channelCount = channelCount;
         return _init(sampleHz);
@@ -148,8 +163,9 @@ public:
      * @return true se o comando foi aceito pelo driver.
      */
     bool start() {
-        if (!_handle) return false;
-        return adc_continuous_start(_handle) == ESP_OK;
+        if (!_handle || _running) return false;
+        _running = adc_continuous_start(_handle) == ESP_OK;
+        return _running;
     }
 
     /**
@@ -159,7 +175,9 @@ public:
      */
     bool stop() {
         if (!_handle) return false;
-        return adc_continuous_stop(_handle) == ESP_OK;
+        if (!_running) return true;
+        _running = adc_continuous_stop(_handle) == ESP_OK ? false : true;
+        return !_running;
     }
 
     /**
@@ -168,9 +186,11 @@ public:
      */
     void deinit() {
         if (_handle) {
-            adc_continuous_deinit(_handle);
+            if (_running && !stop()) return;
+            if (adc_continuous_deinit(_handle) != ESP_OK) return;
             _handle = nullptr;
         }
+        _ready = false;
     }
 
     // ── Leitura ──────────────────────────────────────────────────────────────
@@ -202,24 +222,27 @@ public:
      * @return Número de amostras efetivamente decodificadas (0 se nada).
      */
     size_t read(AdcDmaSample* outBuf, size_t maxSamples) {
-        if (!_handle || !outBuf || maxSamples == 0) return 0;
+        if (!_handle || !outBuf || maxSamples < ADC_DMA_SAMPLES_PER_FRAME) return 0;
         _ready = false;  // limpa o flag ANTES de ler para não perder o próximo frame
 
         // Drena um frame do buffer DMA. timeout=0 → retorna imediatamente.
-        uint8_t  raw[ADC_DMA_FRAME_SIZE];
+        alignas(adc_digi_output_data_t) uint8_t raw[ADC_DMA_FRAME_SIZE];
         uint32_t bytesRead = 0;
         if (adc_continuous_read(_handle, raw, sizeof(raw), &bytesRead, 0) != ESP_OK)
             return 0;
 
         // Cada amostra ocupa exatamente 4 bytes no formato TYPE2 do ESP32-S3
-        const size_t total = bytesRead / 4;
+        const size_t resultBytes = SOC_ADC_DIGI_DATA_BYTES_PER_CONV;
+        if (bytesRead % resultBytes != 0) return 0;
+        const size_t total = bytesRead / resultBytes;
         const size_t n     = (total < maxSamples) ? total : maxSamples;
 
         for (size_t i = 0; i < n; i++) {
-            // Reinterpreta 4 bytes brutos como a union do ESP-IDF
-            const auto* p = reinterpret_cast<const adc_digi_output_data_t*>(&raw[i * 4]);
-            outBuf[i].channel = p->type2.channel;  // campo de 4 bits
-            outBuf[i].value   = p->type2.data;      // campo de 12 bits (0–4095)
+            // Copia para uma estrutura alinhada antes de acessar os campos TYPE2.
+            adc_digi_output_data_t result;
+            std::memcpy(&result, &raw[i * resultBytes], sizeof(result));
+            outBuf[i].channel = result.type2.channel;
+            outBuf[i].value   = result.type2.data;
         }
         return n;
     }
@@ -249,6 +272,7 @@ public:
 
 private:
     adc_continuous_handle_t  _handle              = nullptr;
+    bool                     _running             = false;
     adc_channel_t            _channels[ADC_DMA_MAX_CHANNELS] = {};
     uint8_t                  _channelCount        = 0;
     volatile bool            _ready               = false;  // escrita na ISR, lida no loop

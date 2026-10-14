@@ -1,6 +1,6 @@
 // https://docs.espressif.com/projects/arduino-esp32/en/latest/api/timer.html
 #include <Arduino.h>
-
+#include <Wire.h>
 #include "services/lasecNet.h"
 #include "services/wserial.h"
 #include "services/display_ssd1306.h"
@@ -15,11 +15,8 @@ constexpr uint8_t def_pin_SCL = 22;
 // Usar PERIOD_US >= 20000 µs garante que a leitura termine antes do próximo tick.
 constexpr uint32_t PERIOD_US = 50000; // 50 ms → 20 Hz
 
-// ---------- Timer de hardware ----------
-// API do Arduino-ESP32 v2.x: timerBegin(num, divider, countUp)
-//   num=0      : usa o timer 0 do ESP32 (0–3 disponíveis)
-//   divider=80 : 80 MHz ÷ 80 = 1 MHz → 1 tick = 1 µs
-//   countUp    : conta de 0 para cima até o alarme
+// ---------- Timer de hardware (Arduino-ESP32 3.x) ----------
+// timerBegin recebe a frequência do contador em Hz. A 1 MHz, cada tick vale 1 µs.
 static hw_timer_t* _timer = nullptr;
 
 // ---------- Flag de sincronização ISR → loop() ----------
@@ -47,28 +44,30 @@ static uint16_t _pot1        = 0;
 static uint16_t _pot2        = 0;
 static uint32_t _sampleCount = 0;
 
-// ---------- Setup ----------
+// ---------- Setup ----------S
 void setup() {
     wserial.begin();
-    disp.begin(def_pin_SDA, def_pin_SCL);
+    Wire.begin(def_pin_SDA, def_pin_SCL);
+    disp.begin(Wire);
     net.begin(KIT_HOSTNAME);
 
     disp.setText(1, (WiFi.localIP().toString() + " ID:" + String(KIT_ID)).c_str());
     disp.setText(2, KIT_HOSTNAME);
     disp.setText(3, "ISR ADS1115 20Hz");
 
-    ads1115.begin();
+    ads1115.begin(Wire);
 
-    // timerBegin(num, divider, countUp) — API v2.x
-    _timer = timerBegin(0, 80, true);
-    // timerAttachInterrupt(timer, callback, edge)
-    // edge=true → dispara na borda de subida do sinal de alarme
-    timerAttachInterrupt(_timer, &onTimer, true);
-    // timerAlarmWrite(timer, count, autoreload)
-    // count=50000: 50000 µs = 50 ms → 20 Hz
-    // autoreload=true: reseta e dispara de novo indefinidamente
-    timerAlarmWrite(_timer, PERIOD_US, true);
-    timerAlarmEnable(_timer);
+    // Cria o timer com contador de 1 MHz; nullptr indica falha na inicialização.
+    _timer = timerBegin(1000000);
+    if (_timer == nullptr) return;
+
+    // Associa onTimer à interrupção. A ISR apenas ativa _sampleReady;
+    // a leitura do ADS1115 e o envio dos dados ocorrem no loop().
+    timerAttachInterrupt(_timer, &onTimer);
+
+    // PERIOD_US ticks correspondem a PERIOD_US microssegundos (50 ms = 20 Hz).
+    // autoreload=true repete o alarme; reload_count=0 não limita as repetições.
+    timerAlarm(_timer, PERIOD_US, true, 0);
 }
 
 // ---------- Loop principal ----------
