@@ -1,4 +1,4 @@
-// Exemplo de ADC contínuo com DMA para ESP32-S3 (GPIO4 = ADC1_CH3).
+// Exemplo de ADC contínuo com DMA para ESP32 e ESP32-S3.
 #include <Arduino.h>
 #include <Wire.h>
 #include "services/AdcDmaEsp.h"
@@ -22,8 +22,9 @@ void setup() {
     disp.setText(1, KIT_HOSTNAME); // Exibe o nome do kit.
     disp.setText(3, "ADC DMA 20kHz"); // Exibe o modo de aquisição.
 
-    // Configura ADC1_CH3 (GPIO4) e a taxa de amostragem; interrompe se falhar.
-    if (!adcDma.begin(ADC_CHANNEL_3, SAMPLE_HZ)) return;
+    // ADC1_CH4: GPIO32 no ESP32 comum e GPIO5 no ESP32-S3.
+    // Configura a taxa de amostragem; interrompe se a inicialização falhar.
+    if (!adcDma.begin(ADC_CHANNEL_4, SAMPLE_HZ)) return;
     // Inicia conversões; o hardware grava os resultados no buffer DMA.
     adcDma.start();
 }

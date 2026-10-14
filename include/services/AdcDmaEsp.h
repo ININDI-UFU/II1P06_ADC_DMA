@@ -241,8 +241,13 @@ public:
             // Copia para uma estrutura alinhada antes de acessar os campos TYPE2.
             adc_digi_output_data_t result;
             std::memcpy(&result, &raw[i * resultBytes], sizeof(result));
+#if CONFIG_IDF_TARGET_ESP32
+            outBuf[i].channel = result.type1.channel;
+            outBuf[i].value   = result.type1.data;
+#else
             outBuf[i].channel = result.type2.channel;
             outBuf[i].value   = result.type2.data;
+#endif
         }
         return n;
     }
@@ -319,7 +324,11 @@ private:
         cfg.adc_pattern    = pattern;
         cfg.sample_freq_hz = sampleHz;
         cfg.conv_mode      = ADC_CONV_SINGLE_UNIT_1;
+#if CONFIG_IDF_TARGET_ESP32
+        cfg.format         = ADC_DIGI_OUTPUT_FORMAT_TYPE1;
+#else
         cfg.format         = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
+#endif
 
         if (adc_continuous_config(_handle, &cfg) != ESP_OK) {
             deinit();
